@@ -174,52 +174,8 @@ func (e *Engine) loop(ctx context.Context, host string, addr netip.Addr, out cha
 	slots := make([]hopSlot, e.cfg.MaxHops)
 	payload := make([]byte, e.cfg.PacketSize)
 	e.fillPayload(payload)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	e.limit.Store(int32(len(slots)))
-	var wg sync.WaitGroup
-	e.startWorkers(ctx, addr, payload, slots, cancel, &wg)
-	ticker := time.NewTicker(e.snapshotInterval())
-	defer ticker.Stop()
 	pass := 0
-	for {
-		select {
-		case <-ctx.Done():
-			wg.Wait()
-			return
-		case <-ticker.C:
-			pass++
-			if !e.sendSnapshot(ctx, host, addr, pass, slots, out) {
-				cancel()
-			}
-			if e.cfg.Passes > 0 && pass >= e.cfg.Passes {
-				cancel()
-			}
-		}
-	}
-}
-
-func (e *Engine) snapshotInterval() time.Duration {
-	if e.cfg.Interval > 0 {
-		return e.cfg.Interval
-	}
-	return time.Second
-}
-
-func (e *Engine) startWorkers(ctx context.Context, addr netip.Addr, payload []byte, slots []hopSlot, cancel context.CancelFunc, wg *sync.WaitGroup) {
-	for i := range slots {
-		ttl := i + 1
-		wg.Add(1)
-		go e.runHopWorker(ctx, addr, ttl, payload, &slots[i], cancel, wg)
-	}
-}
-
-func (e *Engine) runHopWorker(ctx context.Context, addr netip.Addr, ttl int, payload []byte, slot *hopSlot, cancel context.CancelFunc, wg *sync.WaitGroup) {
-	defer wg.Done()
-	interval := e.cfg.Interval
-	if interval < 0 {
-		interval = 0
-	}
 	probes := e.cfg.Probes
 	if probes < 1 {
 		probes = 1
@@ -228,28 +184,72 @@ func (e *Engine) runHopWorker(ctx context.Context, addr netip.Addr, ttl int, pay
 		if ctx.Err() != nil {
 			return
 		}
-		if ttl > int(e.limit.Load()) {
+		pass++
+		limit := int(e.limit.Load())
+		if limit < 1 {
+			limit = 1
+		}
+		if limit > len(slots) {
+			limit = len(slots)
+		}
+		if !e.runPass(ctx, addr, payload, slots, limit, probes) {
 			return
 		}
-		elapsed := e.runProbeBurst(ctx, addr, ttl, payload, slot, probes, cancel)
-		if interval == 0 || elapsed >= interval {
-			continue
-		}
-		timer := time.NewTimer(interval - elapsed)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		if !e.sendSnapshot(ctx, host, addr, pass, slots, out) {
 			return
-		case <-timer.C:
+		}
+		if e.cfg.Passes > 0 && pass >= e.cfg.Passes {
+			return
+		}
+		if !e.waitForNextPass(ctx) {
+			return
 		}
 	}
 }
 
-func (e *Engine) runProbeBurst(ctx context.Context, addr netip.Addr, ttl int, payload []byte, slot *hopSlot, probes int, cancel context.CancelFunc) time.Duration {
-	started := time.Now()
+func (e *Engine) runPass(ctx context.Context, addr netip.Addr, payload []byte, slots []hopSlot, limit int, probes int) bool {
+	passCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	errCh := make(chan error, limit)
+	for i := 0; i < limit; i++ {
+		ttl := i + 1
+		wg.Add(1)
+		go func(idx int, hopTTL int) {
+			defer wg.Done()
+			if err := e.runProbeBurst(passCtx, addr, hopTTL, payload, &slots[idx], probes); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				cancel()
+			}
+		}(i, ttl)
+	}
+	wg.Wait()
+	close(errCh)
+	return len(errCh) == 0
+}
+
+func (e *Engine) waitForNextPass(ctx context.Context) bool {
+	interval := e.cfg.Interval
+	if interval <= 0 {
+		return true
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (e *Engine) runProbeBurst(ctx context.Context, addr netip.Addr, ttl int, payload []byte, slot *hopSlot, probes int) error {
 	for i := 0; i < probes; i++ {
 		if ctx.Err() != nil {
-			return time.Since(started)
+			return ctx.Err()
 		}
 		slot.addSent()
 		reply, err := e.adapter.Echo(ctx, addr, ttl, payload, e.cfg.Timeout)
@@ -265,11 +265,10 @@ func (e *Engine) runProbeBurst(ctx context.Context, addr netip.Addr, ttl int, pa
 			}
 		case errors.Is(err, ErrTimeout):
 		default:
-			cancel()
-			return time.Since(started)
+			return err
 		}
 	}
-	return time.Since(started)
+	return nil
 }
 
 func (e *Engine) sendSnapshot(ctx context.Context, host string, addr netip.Addr, pass int, slots []hopSlot, out chan<- Snapshot) bool {
